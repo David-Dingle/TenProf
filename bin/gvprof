@@ -135,10 +135,12 @@ export LD_LIBRARY_PATH=/home/${USER_NAME}/anaconda3/envs/${CONDA_ENV}/lib/:$LD_L
 export LD_LIBRARY_PATH=/home/${USER_NAME}/anaconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages/torch/lib/:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/home/${USER_NAME}/anaconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages/torchvision/lib/:$LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=/home/${USER_NAME}/anaconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages/torchaudio/lib/:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/home/${USER_NAME}/anaconda3/envs/${CONDA_ENV}/lib/python3.11/site-packages/nvidia/cudnn/lib/:$LD_LIBRARY_PATH
 
 time hpcrun -e gpu=nvidia -o $MEASUREMENTS python $GVPROF_EXEC $GVPROF_ARGS &> $GVPROF_REDIRECT
 
 rm -rf $MEASUREMENTS/*.hpcrun
+rm -rf $MEASUREMENTS/torch_view
 
 if [ ! -z "$GVPROF_CFG" ]
 then
@@ -176,7 +178,7 @@ cd $MEASUREMENTS/structs
   /home/xjding/Projects/GPA/GPA/gpa/hpctoolkit/bin/hpcstruct -j $GVPROF_THREADS /home/$USER_NAME/anaconda3/envs/$CONDA_ENV/lib/python3.11/site-packages/torch/lib/libcudnn_engines_precompiled.so.9 &>> $GVPROF_REDIRECT
   # /home/xjding/Projects/GPA/GPA/gpa/hpctoolkit/bin/hpcstruct -j $GVPROF_THREADS /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcudnn_engines_precompiled.so.9.7.0 &>> $GVPROF_REDIRECT
 
-  /home/xjding/Projects/GPA/GPA/gpa/hpctoolkit/bin/hpcstruct -j $GVPROF_THREADS /home/$USER_NAME/anaconda3/envs/$CONDA_ENV/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so &>> $GVPROF_REDIRECT
+  # /home/xjding/Projects/GPA/GPA/gpa/hpctoolkit/bin/hpcstruct -j $GVPROF_THREADS /home/$USER_NAME/anaconda3/envs/$CONDA_ENV/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so &>> $GVPROF_REDIRECT
 
   for fullfile in ./*
   do
@@ -196,17 +198,6 @@ cd ../..
 # time hpcstruct $GVPROF_EXEC -o $BASENAME".hpcstruct" &>> $GVPROF_REDIRECT
 
 echo "Second pass: profiling"
-## Setting 1 for .cu codes
-#$GVPROF_LAUNCHER hpcrun -e gpu=nvidia,$GVPROF_EVENT$GVPROF_SAMPLING_FREQUENCY -o $MEASUREMENTS $GVPROF_CONTROL_KNOBS $GVPROF_EXEC $GVPROF_ARGS &>> $GVPROF_REDIRECT
-# Setting 2 for PyTorch codes
-#hpcrun -e gpu=nvidia,$GVPROF_EVENT$GVPROF_SAMPLING_FREQUENCY -o $MEASUREMENTS $GVPROF_CONTROL_KNOBS python $GVPROF_EXEC $GVPROF_ARGS &>> $GVPROF_REDIRECT
-# Setting 3  for torch monitor
-# hpcrun -e gpu=nvidia,$GVPROF_EVENT$GVPROF_SAMPLING_FREQUENCY -o $MEASUREMENTS -ck HPCRUN_SANITIZER_READ_TRACE_IGNORE=1 -ck  HPCRUN_SANITIZER_TORCH_ANALYSIS=1 -ck HPCRUN_SANITIZER_GPU_ANALYSIS_BLOCKS=0 -ck HPCRUN_SANITIZER_GPU_PATCH_RECORD_NUM=131072 python $GVPROF_EXEC $GVPROF_ARGS &>> $GVPROF_REDIRECT
-if [ $GVPROF_EVENT = "redundancy" ]
-then
-# Setting 4  for redundancy
-time hpcrun -e gpu=nvidia,$GVPROF_EVENT$GVPROF_SAMPLING_FREQUENCY -o $MEASUREMENTS -ck HPCRUN_SANITIZER_MEM_VIEWS=10 -ck HPCRUN_SANITIZER_PC_VIEWS=10 python $GVPROF_EXEC $GVPROF_ARGS &>> $GVPROF_REDIRECT
-fi
 if [ $GVPROF_EVENT = "torch_view" ]
 then
 # Setting torch-view 
@@ -216,5 +207,3 @@ fi
 echo "Invoke hpcprof"
 # hpcstruct /home/xjding/anaconda3/envs/new_torch_monitor/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so
 time hpcprof -o $DATABASE $MEASUREMENTS &>> $GVPROF_REDIRECT
-
-# hpcprof -S $BASENAME".hpcstruct" -o $DATABASE $MEASUREMENTS &>> $GVPROF_REDIRECT

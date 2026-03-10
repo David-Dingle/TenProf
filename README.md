@@ -1,16 +1,15 @@
-# DrGPUM
+# TenProf
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7588406.svg)](https://doi.org/10.5281/zenodo.7588406)
 [![CodeFactor](https://www.codefactor.io/repository/github/lin-mao/drgpum/badge)](https://www.codefactor.io/repository/github/lin-mao/drgpum)
 [![Documentation Status](https://readthedocs.org/projects/drgpum/badge/?version=latest)](https://drgpum.readthedocs.io/en/latest/?badge=latest)
 
 
-DrGPUM is a memory profiler for NVIDIA GPUs to explore memory inefficiencies in GPU-accelerated applications.
-
+TenProf: A Tensor-Centric Profiler for Deep Learning Workload Analysis and Optimization
 ## Quick Start
 
 ```bash
-gh repo clone https://github.com/David-Dingle/DrGPUM.git -- --recurse-submodules && cd DrGPUM
+gh repo clone git@github.com:David-Dingle/TenProf.git -- --recurse-submodules && cd TenProf
 
 # Specify PyTorch dir
 export PYTORCH_DIR=path_to_pytorch/torch
@@ -19,10 +18,10 @@ export PYTORCH_DIR=path_to_pytorch/torch
 ./bin/install
 
 # Setup environment variables
-export DrGPUM_PATH=$(pwd)/gvprof
-export PATH=${DrGPUM_PATH}/bin:$PATH
-export PATH=${DrGPUM_PATH}/hpctoolkit/bin:$PATH
-export PATH=${DrGPUM_PATH}/redshow/bin:$PATH
+export TenProf_PATH=$(pwd)/gvprof
+export PATH=${TenProf_PATH}/bin:$PATH
+export PATH=${TenProf_PATH}/hpctoolkit/bin:$PATH
+export PATH=${TenProf_PATH}/redshow/bin:$PATH
 
 # Test a sample
 conda activate PYTORCH_ENV_NAME
