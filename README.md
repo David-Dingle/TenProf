@@ -36,4 +36,4 @@ gvprof -env PYTORCH_ENV_NAME -v -cfg -j THREADS -e torch_view pytorch_exec.py ar
 
 ## Papers
 
-- Mao Lin, Keren Zhou, and Pengfei Su. 2023. [DrGPUM: Guiding Memory Optimization for GPU-accelerated Applications](https://doi.org/10.1145/3582016.3582044). In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3 (ASPLOS ’23), March 25–29, 2023, Vancouver, BC, Canada. ACM, New York, NY, USA, 15 pages.
+- Xingjian Ding, Keren Zhou, Yueming Hao, and Pengfei Su. 2026. TenProf: A Tensor-Centric Profiler for Deep Learning Workload Analysis and Optimization. The ACM International Conference on Supercomputing, July 6-9, 2026, Belfast, Northern Ireland, UK.
