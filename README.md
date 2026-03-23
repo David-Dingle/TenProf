@@ -1,10 +1,5 @@
 # TenProf
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.7588406.svg)](https://doi.org/10.5281/zenodo.7588406)
-[![CodeFactor](https://www.codefactor.io/repository/github/lin-mao/drgpum/badge)](https://www.codefactor.io/repository/github/lin-mao/drgpum)
-[![Documentation Status](https://readthedocs.org/projects/drgpum/badge/?version=latest)](https://drgpum.readthedocs.io/en/latest/?badge=latest)
-
-
 TenProf: A Tensor-Centric Profiler for Deep Learning Workload Analysis and Optimization
 ## Quick Start
 
