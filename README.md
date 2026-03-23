@@ -23,11 +23,6 @@ conda activate PYTORCH_ENV_NAME
 gvprof -env PYTORCH_ENV_NAME -v -cfg -j THREADS -e torch_view pytorch_exec.py args
 ```
 
-## Documentation
-
-- [Installation Guide](https://drgpum.readthedocs.io/en/latest/install.html)
-- [User's Guide](https://drgpum.readthedocs.io/en/latest/manual.html)
-- [Developer's Guide](https://drgpum.readthedocs.io/en/latest/workflow.html)
 
 ## Papers
 
