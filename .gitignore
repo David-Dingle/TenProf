@@ -1,0 +1,24 @@
+gvprof/
+tenprof/
+build/
+*.o
+*.so
+__pycache__/
+.idea/
+
+# compilation targets (build your own)
+builddir/
+redshow/build/
+redshow/lib/
+hpctoolkit/builddir/
+*.so.*
+*.a
+*.fatbin
+
+# profiling run outputs
+out-measurements/
+out-database/
+*-measurements/
+*-database/
+tenprof.log
+core.*

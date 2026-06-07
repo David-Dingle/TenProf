@@ -1,0 +1,22 @@
+name: ci-style
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+jobs:
+  check-style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if all files end in newline
+        run: ./scripts/endline_lint.sh
+
+      - name:  Check style
+        uses: DoozyX/clang-format-lint-action@v0.16.2
+        with:
+          source: '.'
+          clangFormatVersion: 16

@@ -1,0 +1,207 @@
+#!/bin/bash
+#
+# TenProf installer
+# ------------------
+# Builds TenProf (newest HPCToolkit + GPU profiling extensions) into a prefix.
+#
+# Usage:
+#   ./bin/install [PREFIX] [CUDA_PATH] [SANITIZER_PATH]
+#     PREFIX          install prefix          (default: <repo>/tenprof)
+#     CUDA_PATH       CUDA toolkit root       (default: /usr/local/cuda)
+#     SANITIZER_PATH  compute-sanitizer root  (default: $CUDA_PATH/compute-sanitizer)
+#
+# Environment knobs:
+#   TENPROF_BUILD_ENV   conda env holding the build toolchain (default: hpctk-build)
+#   JOBS                parallel build jobs   (default: nproc)
+#
+# Unlike the old GPA/DrGPUM installers, the newest HPCToolkit uses Meson +
+# meson `subprojects/*.wrap` (which auto-fetch & build dyninst, elfutils,
+# libunwind, xed, xerces-c, ... ), so spack is NOT required. We only need a
+# small, pinned build toolchain (meson, cmake>=4.3, patchelf, gawk, ninja),
+# which we provide via an isolated conda-forge environment.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Arguments / paths
+# ---------------------------------------------------------------------------
+SOURCE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+DIR="${1:-$SOURCE_DIR/tenprof}"
+CUDA_PATH="${2:-/usr/local/cuda}"
+SANITIZER_PATH="${3:-$CUDA_PATH/compute-sanitizer}"
+
+CONDA_ENV="${TENPROF_BUILD_ENV:-hpctk-build}"
+JOBS="${JOBS:-$(nproc)}"
+
+echo "==> TenProf install"
+echo "    PREFIX         = $DIR"
+echo "    CUDA_PATH      = $CUDA_PATH"
+echo "    SANITIZER_PATH = $SANITIZER_PATH"
+echo "    BUILD ENV      = $CONDA_ENV"
+echo "    JOBS           = $JOBS"
+
+mkdir -p "$DIR"
+
+# Capture the user's CURRENTLY-ACTIVE conda env BEFORE we switch to the toolchain
+# env. torch-monitor/redshow are built against whatever PyTorch is active at install
+# time (no hardcoded env), exactly like DrGPUM/bin/install. Override with PYTORCH_DIR.
+USER_CONDA_PREFIX="${CONDA_PREFIX:-}"
+
+# ---------------------------------------------------------------------------
+# Build toolchain (conda-forge env: meson, cmake>=4.3, patchelf, gawk, ninja)
+# ---------------------------------------------------------------------------
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/anaconda3")
+# shellcheck disable=SC1091
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
+if ! conda env list | awk '{print $1}' | grep -qx "$CONDA_ENV"; then
+  echo "==> Creating build toolchain env '$CONDA_ENV'"
+  conda create -y -n "$CONDA_ENV" -c conda-forge \
+    "meson>=1.6,<2" "cmake>=4.3,<5" "patchelf>=0.11,<0.18" \
+    "gawk>=5.3" "make>=4.4" "sed>=4.9" ninja pkg-config
+fi
+conda activate "$CONDA_ENV"
+
+# Make CUDA visible to Meson's CUDA/CUPTI detection and to nvcc.
+export PATH="$CUDA_PATH/bin:$PATH"
+export CUDAToolkit_ROOT="$CUDA_PATH"
+export CUDA_PATH="$CUDA_PATH"
+
+# The libpfm subproject's perf_examples link against the env's ncursesw, which
+# pulls in `-ltinfow`; the conda lib dir is only on the linker's rpath-link, not
+# its search path. Put it on LIBRARY_PATH so `ld` can resolve -ltinfow.
+export LIBRARY_PATH="${CONDA_PREFIX}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+
+# ===========================================================================
+# Step 2/3 components: gpu-patch + torch-monitor + redshow (consumed by the
+# hpctoolkit build below, which links libredshow + libsanitizer-public).
+#
+# Build ORDER matters: redshow needs libunwind headers, which come from
+# HPCToolkit's meson subproject. So we 'meson setup' FIRST (downloads the
+# subprojects), THEN build redshow, THEN 'meson compile' (which links redshow).
+# ===========================================================================
+
+# Detect PyTorch from the active env (captured before the toolchain switch).
+PYTORCH_BASE="${USER_CONDA_PREFIX:-$(dirname "$(command -v conda)")/..}"
+PYTORCH_DIR="${PYTORCH_DIR:-$(ls -d "${PYTORCH_BASE}"/lib/python*/site-packages/torch/ 2>/dev/null | head -n1)}"
+
+echo "==> Building gpu-patch (compute-sanitizer fatbins; Makefile ARCHS includes sm_89)"
+cd "$SOURCE_DIR"
+make PREFIX="$DIR/gpu-patch" SANITIZER_PATH="$SANITIZER_PATH" CUDA_PATH="$CUDA_PATH" install
+
+# ---------------------------------------------------------------------------
+# HPCToolkit: meson SETUP (configure + fetch/extract subprojects). This makes
+# the libunwind headers available for the redshow build below.
+# ---------------------------------------------------------------------------
+echo "==> Configuring HPCToolkit (meson setup)"
+cd "$SOURCE_DIR/hpctoolkit"
+MESON_OPTS=(
+  -Dcuda=enabled
+  -Dtests=disabled
+  -Dmanpages=disabled
+  -Dmanual=disabled
+  -Dhpcprof_mpi=disabled
+)
+if [ ! -d builddir ]; then
+  meson setup builddir --prefix="$DIR/hpctoolkit" "${MESON_OPTS[@]}"
+else
+  meson configure builddir --prefix="$DIR/hpctoolkit" "${MESON_OPTS[@]}"
+fi
+
+if [ -n "$PYTORCH_DIR" ] && [ -d "$PYTORCH_DIR" ]; then
+  # IMPORTANT: we are inside the toolchain env (hpctk-build) whose own python would
+  # otherwise be picked up by find_package(Python) -- and it has no torch. Point
+  # cmake at the PyTorch env's python (the one that owns PYTORCH_DIR).
+  PYTHON_EXE="${USER_CONDA_PREFIX:+$USER_CONDA_PREFIX/bin/python}"
+  [ -x "$PYTHON_EXE" ] || PYTHON_EXE="$(cd "$PYTORCH_DIR/../../../.." && pwd)/bin/python"
+  echo "==> Building torch-monitor (TORCH_DIR=$PYTORCH_DIR, PYTHON=$PYTHON_EXE)"
+  rm -rf "$DIR/torch-monitor"; mkdir -p "$DIR/torch-monitor"
+  cd "$DIR/torch-monitor"
+  cmake "$SOURCE_DIR/torch-monitor" -DTORCH_DIR="$PYTORCH_DIR" -DPython_EXECUTABLE="$PYTHON_EXE"
+  make -j"$JOBS" install DESTDIR="$DIR/torch-monitor"
+
+  # redshow deps: Boost = system /usr (same Boost HPCToolkit's boost_dep uses);
+  # libunwind = HPCToolkit's meson subproject (system has the .so but not the
+  # dev header). -lunwind itself resolves against the system libunwind.so.
+  BOOST_DIR="${BOOST_DIR:-/usr}"
+  LIBUNWIND_DIR="${LIBUNWIND_DIR:-$(ls -d "$SOURCE_DIR"/hpctoolkit/subprojects/libunwind-*/ 2>/dev/null | head -n1)}"
+  LIBUNWIND_DIR="${LIBUNWIND_DIR%/}"
+  if [ -z "$LIBUNWIND_DIR" ] || [ ! -f "$LIBUNWIND_DIR/include/libunwind.h" ]; then
+    echo "ERROR: libunwind headers not found under hpctoolkit/subprojects (meson setup should have fetched them)."
+    echo "       Set LIBUNWIND_DIR to a prefix containing include/libunwind.h and re-run."
+    exit 1
+  fi
+  echo "==> Building redshow (BOOST_DIR=$BOOST_DIR LIBUNWIND_DIR=$LIBUNWIND_DIR)"
+  cd "$SOURCE_DIR/redshow"
+  make clean || true
+  make -j"$JOBS" PREFIX="$DIR/redshow" BOOST_DIR="$BOOST_DIR" LIBUNWIND_DIR="$LIBUNWIND_DIR" \
+    GPU_PATCH_DIR="$DIR/gpu-patch" TORCH_MONITOR_DIR="$DIR/torch-monitor/usr/local" install
+else
+  echo "WARNING: no PyTorch in active env ($PYTORCH_BASE); skipping torch-monitor + redshow."
+  echo "         Activate a PyTorch env (or set PYTORCH_DIR) and re-run to enable torch_view."
+  echo "         (HPCToolkit will fail to link libredshow until redshow is built.)"
+fi
+
+# ---------------------------------------------------------------------------
+# HPCToolkit: compile + install (links libredshow + libsanitizer-public).
+# NOTE: src/hpcrun/meson.build hardcodes the redshow/gpu-patch/sanitizer paths
+# relative to <repo>/tenprof; keep PREFIX at the default unless you also update
+# those link_args.
+# ---------------------------------------------------------------------------
+echo "==> Building HPCToolkit (meson compile + install)"
+cd "$SOURCE_DIR/hpctoolkit"
+meson compile -C builddir -j "$JOBS"
+meson install -C builddir
+
+# ---------------------------------------------------------------------------
+# Make the install relocatable / runnable from a non-system prefix.
+#
+# Meson installs the heavy subproject libs (dyninst, elfutils, xerces-c) under
+# $PREFIX/hpctoolkit/lib/x86_64-linux-gnu with EMPTY rpath, so hpcstruct/hpcprof
+# can't find them (or their transitive deps) outside the default loader path.
+# Give every installed .so an $ORIGIN rpath, and every tool an $ORIGIN/../lib
+# rpath, using DT_RPATH (transitive) so the whole dependency chain resolves.
+# ---------------------------------------------------------------------------
+HPCLIB="$DIR/hpctoolkit/lib/x86_64-linux-gnu"
+if [ -d "$HPCLIB" ]; then
+  # Use --add-rpath (additive) so we don't clobber link-time rpaths baked into
+  # libhpcrun.so (libredshow, libsanitizer-public, torch-monitor); just add $ORIGIN
+  # so the dyninst/elfutils siblings in this dir also resolve.
+  find "$HPCLIB" -type f -name '*.so*' -exec \
+    patchelf --add-rpath '$ORIGIN' {} \; 2>/dev/null || true
+  # Tools live at different depths ($PREFIX/bin and $PREFIX/libexec/hpctoolkit),
+  # so include both 1-level and 2-level relative paths to the libdir.
+  TOOL_RPATH='$ORIGIN/../lib/x86_64-linux-gnu:$ORIGIN/../../lib/x86_64-linux-gnu:$ORIGIN/../lib:$ORIGIN/../../lib'
+  for d in "$DIR/hpctoolkit/bin" "$DIR/hpctoolkit/libexec/hpctoolkit"; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 1 -type f -exec sh -c '
+      file -b "$1" | grep -q ELF && patchelf --force-rpath --set-rpath "$2" "$1"
+    ' _ {} "$TOOL_RPATH" \; 2>/dev/null || true
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Launcher: install the `tenprof` driver (warmup -> hpcstruct -> torch_view ->
+# hpcprof). It locates this install relative to its own path, so it works from
+# either <repo>/bin/tenprof or <prefix>/bin/tenprof.
+# ---------------------------------------------------------------------------
+mkdir -p "$DIR/bin"
+cp "$SOURCE_DIR/bin/tenprof" "$DIR/bin/"
+chmod +x "$DIR/bin/tenprof"
+
+echo
+echo "==> Done."
+echo "    HPCToolkit : $DIR/hpctoolkit"
+echo "    redshow    : $DIR/redshow        torch-monitor: $DIR/torch-monitor"
+echo "    gpu-patch  : $DIR/gpu-patch"
+echo
+echo "    Profile a PyTorch script (activate your PyTorch env first; the tenprof"
+echo "    driver self-locates this install and sets PATH/LD_LIBRARY_PATH):"
+echo "        conda activate <pytorch-env>"
+echo "        $SOURCE_DIR/bin/tenprof -e torch_view -j \$(nproc) -o out your_script.py [args]"
+echo
+echo "    Outputs:"
+echo "        out-measurements/torch_view/forest.txt                       (tensor forest)"
+echo "        out-measurements/torch_view/torch_view_report.csv            (per-tensor accesses)"
+echo "        out-measurements/torch_view/torch_view_report.csv.context    (tensor call paths)"
+echo "        out-database/                                                (HPCToolkit database)"

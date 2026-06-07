@@ -1,0 +1,29 @@
+name: ci-cpu
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install dependencies
+        run: |
+          pip3 install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cpu
+      - name: build
+        run: |
+          export TORCH_DIR=`pip show torch | grep Location | cut -d ":" -f 2`/torch
+          export TORCH_DIR=`echo $TORCH_DIR | xargs echo -n`
+          mkdir build
+          cd build
+          cmake .. -DTORCH_DIR=$TORCH_DIR
+          make -j
+      - name: tests
+        run: |
+          cd build
+          ctest -R add_cpu
+          ctest -R mnist_cpu

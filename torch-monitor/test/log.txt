@@ -1,0 +1,21 @@
+Make sure gvprof-measurements and gvprof-database is clean
+First pass: dump and analyze CPU and GPU binaries
+
+real	0m3.904s
+user	0m8.785s
+sys	0m1.066s
+
+real	9m31.749s
+user	12m13.955s
+sys	0m20.681s
+Second pass: profiling
+/home/xjding/Projects/new_DrGPUM/DrGPUM/gvprof/bin/gvprof: line 206: 123927 Segmentation fault      (core dumped) hpcrun -e gpu=nvidia,$GVPROF_EVENT$GVPROF_SAMPLING_FREQUENCY -o $MEASUREMENTS -ck HPCRUN_SANITIZER_TORCH_VIEW=1 -ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=1 python $GVPROF_EXEC $GVPROF_ARGS &> $GVPROF_REDIRECT
+
+real	0m3.014s
+user	0m0.175s
+sys	0m0.646s
+Invoke hpcprof
+
+real	0m0.013s
+user	0m0.004s
+sys	0m0.009s

@@ -1,0 +1,168 @@
+#!/bin/bash
+#
+# tenprof — standardized TenProf profiling driver.
+# Modeled on DrGPUM/bin/gvprof, adapted for the newest HPCToolkit and the
+# gpu=cuda,torch_view event.
+#
+# Four phases:
+#   1. warmup  : hpcrun -e gpu=cuda           -> dumps GPU cubins (gpubins/)
+#   2. struct  : hpcstruct --gpucfg yes        -> disassembles cubins (+ CPU libs)
+#   3. torch_view : hpcrun -e gpu=cuda,torch_view -> compute-sanitizer + redshow
+#                   tensor-view analysis (torch_view/forest.txt, report.csv)
+#   4. prof    : hpcprof                        -> tensor-attributed database
+#
+# Usage:
+#   tenprof [options] <python-script> [script args]
+#   options:
+#     -e <event>     profiling event (default: torch_view)
+#     -j <threads>   hpcstruct/hpcprof threads (default: nproc)
+#     -env <name>    conda env to activate (default: current active env)
+#     -o <dir>       output prefix (default: tenprof). Produces <dir>-measurements
+#                    and <dir>-database
+#     -ck <knob>     extra control knob, e.g. -ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=1
+#                    (repeatable)
+#     -l <launcher>  launcher prefix, e.g. -l "mpirun -np 1"
+#     -no-warmup     skip the warmup+hpcstruct passes (analysis only)
+#     -v             verbose: tee logs to tenprof.log instead of /dev/null
+#     -h             help
+
+set -o pipefail
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+# ---------------------------------------------------------------------------
+# Defaults / arg parsing
+# ---------------------------------------------------------------------------
+EVENT=torch_view
+THREADS=$(nproc)
+CONDA_ENV=""
+OUT=tenprof
+CONTROL_KNOBS=""
+LAUNCHER=""
+VERBOSE=0
+DO_WARMUP=1
+
+while test "x$1" != x; do
+  arg="$1"; shift
+  case "$arg" in
+    -e)   EVENT="$1"; shift ;;
+    -j)   THREADS="$1"; shift ;;
+    -env) CONDA_ENV="$1"; shift ;;
+    -o)   OUT="$1"; shift ;;
+    -ck)  CONTROL_KNOBS="$CONTROL_KNOBS -ck $1"; shift ;;
+    -l)   LAUNCHER="$1"; shift ;;
+    -no-warmup) DO_WARMUP=0 ;;
+    -v)   VERBOSE=1 ;;
+    -h)   usage ;;
+    *)    set -- "$arg" "$@"; break ;;
+  esac
+done
+
+EXEC="$1"; shift
+ARGS="$*"
+if [ -z "$EXEC" ]; then echo "tenprof: no executable/script given"; exit 1; fi
+
+MEAS="${OUT}-measurements"
+DB="${OUT}-database"
+if [ "$VERBOSE" = 1 ]; then REDIR=./tenprof.log; : > "$REDIR"; else REDIR=/dev/null; fi
+log() { echo "==> $*"; }
+
+# ---------------------------------------------------------------------------
+# Locate the TenProf install
+# ---------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TENPROF_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+PREFIX="${TENPROF_PREFIX:-$TENPROF_ROOT/tenprof}"
+HPCBIN="$PREFIX/hpctoolkit/bin"
+CUDA_PATH="${CUDA_PATH:-/usr/local/cuda}"
+SANITIZER_PATH="$CUDA_PATH/compute-sanitizer"
+
+for t in hpcrun hpcstruct hpcprof; do
+  [ -x "$HPCBIN/$t" ] || { echo "tenprof: $HPCBIN/$t not found (run bin/install first)"; exit 1; }
+done
+
+# ---------------------------------------------------------------------------
+# Conda env (for PyTorch). Default: whatever is active.
+# ---------------------------------------------------------------------------
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "$HOME/anaconda3")
+# shellcheck disable=SC1091
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+if [ -n "$CONDA_ENV" ]; then conda activate "$CONDA_ENV"; fi
+TORCH_LIB=$(python -c 'import os,torch;print(os.path.dirname(torch.__file__)+"/lib")' 2>/dev/null)
+PY_BIN=$(command -v python)
+
+# ---------------------------------------------------------------------------
+# Runtime library path: CUDA / CUPTI / compute-sanitizer + the TenProf deps +
+# the active env's torch libs. (HPCTOOLKIT dlopen's libcupti; sanitizer dlopen's
+# libsanitizer-public; libredshow/libtorch_monitor are rpath'd into libhpcrun.)
+# ---------------------------------------------------------------------------
+export PATH="$HPCBIN:$CUDA_PATH/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_PATH/extras/CUPTI/lib64:$SANITIZER_PATH:$CUDA_PATH/lib64:$PREFIX/../torch-monitor/usr/local/lib:$PREFIX/../redshow/lib:${TORCH_LIB:+$TORCH_LIB:}$LD_LIBRARY_PATH"
+
+log "TenProf install : $PREFIX"
+log "conda env       : ${CONDA_ENV:-$(basename "${CONDA_PREFIX:-?}")}  (python=$PY_BIN)"
+log "event           : $EVENT   threads=$THREADS"
+log "measurements    : $MEAS    database=$DB"
+
+rm -rf "$MEAS" "$DB"
+
+# ---------------------------------------------------------------------------
+# hpcstruct helper for CPU support libraries (best-effort; skip if missing)
+# ---------------------------------------------------------------------------
+struct_lib() { [ -e "$1" ] && hpcstruct -j "$THREADS" "$1" >>"$REDIR" 2>&1 || true; }
+
+if [ "$DO_WARMUP" = 1 ]; then
+  # -------------------------------------------------------------------------
+  # Phase 1: warmup — dump GPU cubins via CUPTI (no sanitizer, fast)
+  # -------------------------------------------------------------------------
+  log "[1/4] warmup: dumping cubins (gpu=cuda)"
+  $LAUNCHER hpcrun -e gpu=cuda -o "$MEAS" "$PY_BIN" "$EXEC" $ARGS >"$REDIR" 2>&1
+
+  # -------------------------------------------------------------------------
+  # Phase 2: hpcstruct. NOTE: the new hpcstruct needs the warmup .hpcrun files
+  # present to discover the measurement, so struct FIRST, then drop them.
+  # -------------------------------------------------------------------------
+  log "[2/4] hpcstruct --gpucfg yes (cubins + CPU libs)"
+  hpcstruct --gpucfg yes -j "$THREADS" "$MEAS" >>"$REDIR" 2>&1
+  if [ -d "$MEAS/structs" ]; then
+    ( cd "$MEAS/structs"
+      struct_lib "$PY_BIN"
+      struct_lib "$PREFIX/hpctoolkit/lib/x86_64-linux-gnu/libhpcrun.so"
+      struct_lib /usr/lib/x86_64-linux-gnu/libcuda.so
+      struct_lib "$CUDA_PATH/extras/CUPTI/lib64/libcupti.so"
+      struct_lib "$SANITIZER_PATH/libsanitizer-public.so"
+      for so in libtorch_cuda.so libc10_cuda.so libtorch_python.so; do
+        struct_lib "$TORCH_LIB/$so"
+      done
+      # drop struct files that only produced warnings (no usable structure)
+      for w in ./*.warnings; do [ -e "$w" ] && rm -f "${w%.warnings}.hpcstruct"; done
+    )
+  fi
+  # keep cubins + structs, drop warmup profile so the torch_view pass owns it
+  rm -f "$MEAS"/*.hpcrun "$MEAS"/*.log
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3: torch_view — compute-sanitizer + redshow tensor analysis
+# ---------------------------------------------------------------------------
+if [ "$EVENT" = torch_view ]; then
+  log "[3/4] torch_view profiling (gpu=cuda,torch_view)"
+  $LAUNCHER hpcrun -e gpu=cuda,torch_view -o "$MEAS" $CONTROL_KNOBS \
+    "$PY_BIN" "$EXEC" $ARGS >"$REDIR" 2>&1
+else
+  log "[3/4] profiling (gpu=cuda,$EVENT)"
+  $LAUNCHER hpcrun -e "gpu=cuda,$EVENT" -o "$MEAS" $CONTROL_KNOBS \
+    "$PY_BIN" "$EXEC" $ARGS >"$REDIR" 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 4: hpcprof — build the (tensor-attributed) database
+# ---------------------------------------------------------------------------
+log "[4/4] hpcprof -> $DB"
+hpcprof -o "$DB" "$MEAS" >>"$REDIR" 2>&1
+
+log "done."
+[ -d "$MEAS/torch_view" ] && echo "    torch_view output: $MEAS/torch_view/{forest.txt,torch_view_report.csv}"
+[ -f "$MEAS/torch_view/torch_view_report.csv.context" ] && \
+  echo "    tensor callpaths : $MEAS/torch_view/torch_view_report.csv.context"
+echo "    database         : $DB"
