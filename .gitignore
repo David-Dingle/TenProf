@@ -22,3 +22,4 @@ out-database/
 *-database/
 tenprof.log
 core.*
+playground/

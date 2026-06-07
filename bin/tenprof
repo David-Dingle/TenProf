@@ -1,20 +1,23 @@
 #!/bin/bash
 #
 # tenprof — standardized TenProf profiling driver.
-# Modeled on DrGPUM/bin/gvprof, adapted for the newest HPCToolkit and the
-# gpu=cuda,torch_view event.
+# Modeled on DrGPUM/bin/gvprof, adapted for the newest HPCToolkit.
 #
-# Four phases:
-#   1. warmup  : hpcrun -e gpu=cuda           -> dumps GPU cubins (gpubins/)
+# Phases:
+#   1. warmup  : hpcrun -e gpu=cuda            -> dumps GPU cubins
 #   2. struct  : hpcstruct --gpucfg yes        -> disassembles cubins (+ CPU libs)
-#   3. torch_view : hpcrun -e gpu=cuda,torch_view -> compute-sanitizer + redshow
-#                   tensor-view analysis (torch_view/forest.txt, report.csv)
-#   4. prof    : hpcprof                        -> tensor-attributed database
+#   3. profile : one or more SEPARATE hpcrun runs (see -e below)
+#   4. prof    : hpcprof                       -> database (tensor bridge: WIP)
+#
+# Events (GPA merge uses two SEPARATE runs that can't share a process):
+#   torch_view  : compute-sanitizer + redshow  -> torch_view/{forest.txt,report.csv}
+#   pc_sampling : NEW CUPTI PC-sampling (stalls)-> pc_sampling/pc_samples.csv
+#   both        : run pc_sampling THEN torch_view into the same measurements dir
 #
 # Usage:
 #   tenprof [options] <python-script> [script args]
 #   options:
-#     -e <event>     profiling event (default: torch_view)
+#     -e <event>     torch_view (default) | pc_sampling | both
 #     -j <threads>   hpcstruct/hpcprof threads (default: nproc)
 #     -env <name>    conda env to activate (default: current active env)
 #     -o <dir>       output prefix (default: tenprof). Produces <dir>-measurements
@@ -23,12 +26,13 @@
 #                    (repeatable)
 #     -l <launcher>  launcher prefix, e.g. -l "mpirun -np 1"
 #     -no-warmup     skip the warmup+hpcstruct passes (analysis only)
+#     -no-prof       skip the hpcprof phase (collection only; bridge is WIP)
 #     -v             verbose: tee logs to tenprof.log instead of /dev/null
 #     -h             help
 
 set -o pipefail
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,31'p "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 # ---------------------------------------------------------------------------
 # Defaults / arg parsing
@@ -41,6 +45,7 @@ CONTROL_KNOBS=""
 LAUNCHER=""
 VERBOSE=0
 DO_WARMUP=1
+DO_PROF=1
 
 while test "x$1" != x; do
   arg="$1"; shift
@@ -52,11 +57,20 @@ while test "x$1" != x; do
     -ck)  CONTROL_KNOBS="$CONTROL_KNOBS -ck $1"; shift ;;
     -l)   LAUNCHER="$1"; shift ;;
     -no-warmup) DO_WARMUP=0 ;;
+    -no-prof)   DO_PROF=0 ;;
     -v)   VERBOSE=1 ;;
     -h)   usage ;;
     *)    set -- "$arg" "$@"; break ;;
   esac
 done
+
+# Which profiling pass(es) to run. `both` does the full GPA 2-run collection:
+# the pc_sampling run (stalls) and the torch_view run (tensor accesses), into the
+# same measurements dir, joined later by hpcprof.
+case "$EVENT" in
+  both) EVENTS="pc_sampling torch_view" ;;
+  *)    EVENTS="$EVENT" ;;
+esac
 
 EXEC="$1"; shift
 ARGS="$*"
@@ -97,7 +111,10 @@ PY_BIN=$(command -v python)
 # libsanitizer-public; libredshow/libtorch_monitor are rpath'd into libhpcrun.)
 # ---------------------------------------------------------------------------
 export PATH="$HPCBIN:$CUDA_PATH/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_PATH/extras/CUPTI/lib64:$SANITIZER_PATH:$CUDA_PATH/lib64:$PREFIX/../torch-monitor/usr/local/lib:$PREFIX/../redshow/lib:${TORCH_LIB:+$TORCH_LIB:}$LD_LIBRARY_PATH"
+# HPCToolkit's own libs (libdw/libelf/libxerces_c/dyninst...) live here; hpcprof
+# needs them at runtime (their rpath isn't always sufficient).
+HPCLIB="$PREFIX/hpctoolkit/lib/x86_64-linux-gnu"
+export LD_LIBRARY_PATH="$HPCLIB:$CUDA_PATH/extras/CUPTI/lib64:$SANITIZER_PATH:$CUDA_PATH/lib64:$PREFIX/../torch-monitor/usr/local/lib:$PREFIX/../redshow/lib:${TORCH_LIB:+$TORCH_LIB:}$LD_LIBRARY_PATH"
 
 log "TenProf install : $PREFIX"
 log "conda env       : ${CONDA_ENV:-$(basename "${CONDA_PREFIX:-?}")}  (python=$PY_BIN)"
@@ -143,26 +160,32 @@ if [ "$DO_WARMUP" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 3: torch_view — compute-sanitizer + redshow tensor analysis
+# Phase 3: profiling pass(es). For the GPA merge these are SEPARATE runs that
+# cannot share a process (pc_sampling uses the CUPTI profiler; torch_view uses
+# the compute-sanitizer — mutually exclusive). Each writes into $MEAS.
 # ---------------------------------------------------------------------------
-if [ "$EVENT" = torch_view ]; then
-  log "[3/4] torch_view profiling (gpu=cuda,torch_view)"
-  $LAUNCHER hpcrun -e gpu=cuda,torch_view -o "$MEAS" $CONTROL_KNOBS \
+for ev in $EVENTS; do
+  log "[3/4] profiling (gpu=cuda,$ev)"
+  $LAUNCHER hpcrun -e "gpu=cuda,$ev" -o "$MEAS" $CONTROL_KNOBS \
     "$PY_BIN" "$EXEC" $ARGS >"$REDIR" 2>&1
+done
+
+# ---------------------------------------------------------------------------
+# Phase 4: hpcprof — build the database (+ tensor bridge once implemented).
+# Skipped with -no-prof (useful while the pc_sampling->tensor bridge is WIP:
+# the collection CSVs are already written above).
+# ---------------------------------------------------------------------------
+if [ "$DO_PROF" = 1 ]; then
+  log "[4/4] hpcprof -> $DB"
+  hpcprof -o "$DB" "$MEAS" >>"$REDIR" 2>&1
 else
-  log "[3/4] profiling (gpu=cuda,$EVENT)"
-  $LAUNCHER hpcrun -e "gpu=cuda,$EVENT" -o "$MEAS" $CONTROL_KNOBS \
-    "$PY_BIN" "$EXEC" $ARGS >"$REDIR" 2>&1
+  log "[4/4] hpcprof skipped (-no-prof)"
 fi
 
-# ---------------------------------------------------------------------------
-# Phase 4: hpcprof — build the (tensor-attributed) database
-# ---------------------------------------------------------------------------
-log "[4/4] hpcprof -> $DB"
-hpcprof -o "$DB" "$MEAS" >>"$REDIR" 2>&1
-
 log "done."
-[ -d "$MEAS/torch_view" ] && echo "    torch_view output: $MEAS/torch_view/{forest.txt,torch_view_report.csv}"
+[ -f "$MEAS/pc_sampling/pc_samples.csv" ] && \
+  echo "    pc-sampling stalls: $MEAS/pc_sampling/pc_samples.csv"
+[ -d "$MEAS/torch_view" ] && echo "    torch_view output : $MEAS/torch_view/{forest.txt,torch_view_report.csv}"
 [ -f "$MEAS/torch_view/torch_view_report.csv.context" ] && \
-  echo "    tensor callpaths : $MEAS/torch_view/torch_view_report.csv.context"
-echo "    database         : $DB"
+  echo "    tensor callpaths  : $MEAS/torch_view/torch_view_report.csv.context"
+[ "$DO_PROF" = 1 ] && echo "    database          : $DB"
