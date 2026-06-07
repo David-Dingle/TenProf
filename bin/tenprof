@@ -13,11 +13,13 @@
 #   torch_view  : compute-sanitizer + redshow  -> torch_view/{forest.txt,report.csv}
 #   pc_sampling : NEW CUPTI PC-sampling (stalls)-> pc_sampling/pc_samples.csv
 #   both        : run pc_sampling THEN torch_view into the same measurements dir
+#   kernel_replay: SINGLE run -- per-kernel checkpoint replay does both PC sampling
+#                  and the sanitizer in one process -> pc_samples.csv + torch_view
 #
 # Usage:
 #   tenprof [options] <python-script> [script args]
 #   options:
-#     -e <event>     torch_view (default) | pc_sampling | both
+#     -e <event>     torch_view (default) | pc_sampling | both | kernel_replay
 #     -j <threads>   hpcstruct/hpcprof threads (default: nproc)
 #     -env <name>    conda env to activate (default: current active env)
 #     -o <dir>       output prefix (default: tenprof). Produces <dir>-measurements
@@ -160,9 +162,16 @@ if [ "$DO_WARMUP" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 3: profiling pass(es). For the GPA merge these are SEPARATE runs that
-# cannot share a process (pc_sampling uses the CUPTI profiler; torch_view uses
-# the compute-sanitizer — mutually exclusive). Each writes into $MEAS.
+# Phase 3: profiling pass(es).
+#   kernel_replay : ONE run. Per-kernel checkpoint replay does the sanitizer
+#                   (tensor accesses) AND PC sampling (memory stalls) in a single
+#                   process, joined by (kernel_id, pc). This is the GPA+DrGPUM
+#                   merge in one pass — preferred.
+#   both          : the older 2-run fallback (pc_sampling then torch_view). These
+#                   are SEPARATE runs that cannot share a process (the CUPTI
+#                   profiler and the compute-sanitizer are mutually exclusive),
+#                   joined later by hpcprof on (pystates_hash, pc).
+# Each writes into $MEAS.
 # ---------------------------------------------------------------------------
 for ev in $EVENTS; do
   log "[3/4] profiling (gpu=cuda,$ev)"
