@@ -40,6 +40,32 @@ thread_local static size_t num__delayed_states;
 thread_local static torch_monitor_python_state_t python_states[MAX_NUM_STATES];
 thread_local static torch_monitor_python_state_t delayed_python_states[MAX_NUM_STATES];
 
+// ---------------------------------------------------------------------------
+// Bounded, always-NUL-terminating C-string copy helpers. The python_state
+// file_name/function_name buffers are fixed char[N] (kept pure-C so the headers
+// stay C-compatible). The source const char* from torch-monitor can be longer
+// than N -- or point at stale/garbage memory from the reused thread_local
+// python_states[] array -- so the previous strcpy/strcat overflowed the buffer
+// and glibc aborted with "*** buffer overflow detected ***". strncpy/strncat
+// read and write at most N bytes, so they tolerate over-long / non-terminated
+// input (truncating instead of crashing).
+// ---------------------------------------------------------------------------
+static inline void tv_copy_cstr(char *dst, const char *src, size_t n) {
+  if (n == 0) return;
+  if (!src) { dst[0] = '\0'; return; }
+  strncpy(dst, src, n - 1);   // copies at most n-1 bytes from src
+  dst[n - 1] = '\0';
+}
+static inline void tv_append_domain(char *dst, size_t n, const char *dom) {
+  if (!dom) return;
+  size_t len = strlen(dst);
+  if (len + 1 >= n) return;          // buffer already full
+  strncat(dst, "^", n - len - 1);    // strncat always NUL-terminates
+  len = strlen(dst);
+  if (len + 1 >= n) return;
+  strncat(dst, dom, n - len - 1);
+}
+
 namespace redshow {
 
  class TorchView final : public Analysis {
@@ -284,8 +310,8 @@ namespace redshow {
      {
       //  ctxid_pcs = std::vector<u64>{};  // init as empty vector
        for (int i = 0; i < (num_states < MAX_NUM_STATES ? num_states : MAX_NUM_STATES); i++){
-         strcpy(py_state[i].file_name, arg_py_state[i].file_name);
-         strcpy(py_state[i].function_name, arg_py_state[i].function_name);
+         tv_copy_cstr(py_state[i].file_name, arg_py_state[i].file_name, sizeof(py_state[i].file_name));
+         tv_copy_cstr(py_state[i].function_name, arg_py_state[i].function_name, sizeof(py_state[i].function_name));
          py_state[i].function_first_lineno = arg_py_state[i].function_first_lineno;
          py_state[i].lineno = arg_py_state[i].lineno;
        }
@@ -443,8 +469,8 @@ namespace redshow {
          PyStateCTX _state{tensor_data.index, num_states, python_states};
          if (!_domain_name.empty()) {
            if (num_states > 0) {
-             strcat(_state.py_state[0].function_name, "^");
-             strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+             tv_append_domain(_state.py_state[0].function_name,
+                              sizeof(_state.py_state[0].function_name), _domain_name.top().c_str());
            }
          }
          _state.object_type = VIEW_NODE;
@@ -485,8 +511,8 @@ namespace redshow {
              PyStateCTX _state{tensor_data.index, num_states, python_states};
              if (!_domain_name.empty()) {
                if (num_states > 0) {
-                 strcat(_state.py_state[0].function_name, "^");
-                 strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+                 tv_append_domain(_state.py_state[0].function_name,
+                                  sizeof(_state.py_state[0].function_name), _domain_name.top().c_str());
                }
              }
              _state.object_type = VIEW_NODE;
@@ -507,8 +533,8 @@ namespace redshow {
        PyStateCTX _state{tensor_data.index, num_states, python_states};
        if (!_domain_name.empty()) {
          if (num_states > 0) {
-           strcat(_state.py_state[0].function_name, "^");
-           strcat(_state.py_state[0].function_name, _domain_name.top().c_str());
+           tv_append_domain(_state.py_state[0].function_name,
+                            sizeof(_state.py_state[0].function_name), _domain_name.top().c_str());
          }
        }
        _state.object_type = VIEW_NODE;

@@ -26,4 +26,4 @@ f = b.T
 g = e[1 : -1, : ]
 h = e[ : ,1 : -1]
 
-out = torch._C._nn.linear(input=x, weight=w, bias=bias)
+out = torch.nn.Linear(x, w)

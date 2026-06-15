@@ -19,7 +19,7 @@
 # Usage:
 #   tenprof [options] <python-script> [script args]
 #   options:
-#     -e <event>     torch_view (default) | pc_sampling | both | kernel_replay
+#     -e <event>     kernel_replay (default) | torch_view | pc_sampling | both
 #     -j <threads>   hpcstruct/hpcprof threads (default: nproc)
 #     -env <name>    conda env to activate (default: current active env)
 #     -o <dir>       output prefix (default: tenprof). Produces <dir>-measurements
@@ -39,7 +39,7 @@ usage() { sed -n '2,31'p "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 # ---------------------------------------------------------------------------
 # Defaults / arg parsing
 # ---------------------------------------------------------------------------
-EVENT=torch_view
+EVENT=kernel_replay
 THREADS=$(nproc)
 CONDA_ENV=""
 OUT=tenprof
@@ -108,15 +108,44 @@ TORCH_LIB=$(python -c 'import os,torch;print(os.path.dirname(torch.__file__)+"/l
 PY_BIN=$(command -v python)
 
 # ---------------------------------------------------------------------------
-# Runtime library path: CUDA / CUPTI / compute-sanitizer + the TenProf deps +
-# the active env's torch libs. (HPCTOOLKIT dlopen's libcupti; sanitizer dlopen's
-# libsanitizer-public; libredshow/libtorch_monitor are rpath'd into libhpcrun.)
+# Runtime library path. Imitates DrGPUM's gvprof launcher: export the FULL set
+# of app/runtime lib dirs a real PyTorch model needs under hpcrun -- the active
+# conda env's runtime (libgcc_s/libstdc++/libomp), torch + torchvision +
+# torchaudio + the wheel-bundled NVIDIA libs (cudnn, cublas, ...), CUDA / CUPTI /
+# compute-sanitizer, and the TenProf deps. (HPCTOOLKIT dlopen's libcupti;
+# sanitizer dlopen's libsanitizer-public; libredshow/libtorch_monitor are rpath'd
+# into libhpcrun; hpcprof needs HPCToolkit's own libdw/libelf/dyninst.)
 # ---------------------------------------------------------------------------
 export PATH="$HPCBIN:$CUDA_PATH/bin:$PATH"
-# HPCToolkit's own libs (libdw/libelf/libxerces_c/dyninst...) live here; hpcprof
-# needs them at runtime (their rpath isn't always sufficient).
 HPCLIB="$PREFIX/hpctoolkit/lib/x86_64-linux-gnu"
-export LD_LIBRARY_PATH="$HPCLIB:$CUDA_PATH/extras/CUPTI/lib64:$SANITIZER_PATH:$CUDA_PATH/lib64:$PREFIX/../torch-monitor/usr/local/lib:$PREFIX/../redshow/lib:${TORCH_LIB:+$TORCH_LIB:}$LD_LIBRARY_PATH"
+CONDA_LIB="${CONDA_PREFIX:+$CONDA_PREFIX/lib}"
+# torchvision / torchaudio lib dirs + the torch-bundled NVIDIA *.so dirs (cudnn,
+# cublas, nccl, ...), present only when installed.
+EXTRA_TORCH_LIBS=$(python - <<'PY' 2>/dev/null
+import os, glob
+dirs = []
+for mod in ("torchvision", "torchaudio"):
+    try: dirs.append(os.path.dirname(__import__(mod).__file__) + "/lib")
+    except Exception: pass
+try:
+    import torch
+    dirs += glob.glob(os.path.dirname(torch.__file__) + "/../nvidia/*/lib")
+except Exception: pass
+print(":".join(d for d in dirs if os.path.isdir(d)))
+PY
+)
+export LD_LIBRARY_PATH="$HPCLIB:$CUDA_PATH/extras/CUPTI/lib64:$SANITIZER_PATH:$CUDA_PATH/lib64:$PREFIX/../torch-monitor/usr/local/lib:$PREFIX/../redshow/lib:${EXTRA_TORCH_LIBS:+$EXTRA_TORCH_LIBS:}${TORCH_LIB:+$TORCH_LIB:}${CONDA_LIB:+$CONDA_LIB:}$LD_LIBRARY_PATH"
+
+# hpctoolkit's bundled libunwind.so (on HPCLIB above) exports the C++ _Unwind_*
+# ABI; with HPCLIB on the search path, libstdc++'s exception personality can bind
+# its unwinder to hpctoolkit's libunwind instead of libgcc_s and CRASH while
+# unwinding a normal C++ exception thrown inside the profiled app (e.g. any torch
+# op that raises -> converts to a Python error). Preload libgcc_s so the C++
+# _Unwind_* symbols resolve to the correct provider regardless of search order;
+# exception handling in the profiled application then works normally under hpcrun.
+GCCS="$(gcc -print-file-name=libgcc_s.so.1 2>/dev/null)"
+[ -e "$GCCS" ] || GCCS=/lib/x86_64-linux-gnu/libgcc_s.so.1
+[ -e "$GCCS" ] && export LD_PRELOAD="$GCCS${LD_PRELOAD:+:$LD_PRELOAD}"
 
 log "TenProf install : $PREFIX"
 log "conda env       : ${CONDA_ENV:-$(basename "${CONDA_PREFIX:-?}")}  (python=$PY_BIN)"
@@ -174,27 +203,58 @@ fi
 # Each writes into $MEAS.
 # ---------------------------------------------------------------------------
 for ev in $EVENTS; do
-  log "[3/4] profiling (gpu=cuda,$ev)"
+  log "[3/5] profiling (gpu=cuda,$ev)"
   $LAUNCHER hpcrun -e "gpu=cuda,$ev" -o "$MEAS" $CONTROL_KNOBS \
     "$PY_BIN" "$EXEC" $ARGS >"$REDIR" 2>&1
 done
 
 # ---------------------------------------------------------------------------
-# Phase 4: hpcprof — build the database (+ tensor bridge once implemented).
-# Skipped with -no-prof (useful while the pc_sampling->tensor bridge is WIP:
-# the collection CSVs are already written above).
+# Phase 4: blame-shift -> Tensor Stall Cost (kernel_replay only). tensor_blame
+# reads pc_samples.csv + torch_view, disassembles the cubins (GPA lib/cuda),
+# blame-shifts memory stalls to their producing loads, and joins on
+# (pystates_hash, pc) -> tensor_stall_cost.csv + blame.dot (graphviz).
+# ---------------------------------------------------------------------------
+if [ "$EVENT" = kernel_replay ] && [ -f "$MEAS/pc_sampling/pc_samples.csv" ]; then
+  TB="$HPCBIN/tensor_blame"
+  [ -x "$TB" ] || TB="$(command -v tensor_blame 2>/dev/null)"
+  if [ -x "$TB" ]; then
+    log "[4/5] tensor_blame -> tensor_stall_cost.csv + blame.dot"
+    TB_THREADS="$THREADS" "$TB" "$MEAS/gpubins" "$MEAS" >>"$REDIR" 2>&1
+    # Render the tensor transformation forest (TenProf paper Figure 7) with plain
+    # graphviz -- all styling (ellipses, solid/dashed outlines+edges, size, color,
+    # tooltips) is emitted in blame.dot, so `dot` alone produces the final SVG.
+    DOT="$(command -v dot 2>/dev/null)"
+    [ -n "$DOT" ] || DOT="$CONDA_BASE/envs/gviz/bin/dot"
+    if [ -f "$MEAS/blame.dot" ] && [ -x "$DOT" ]; then
+      if "$DOT" -Tsvg "$MEAS/blame.dot" -o "$MEAS/blame.dot.svg" >>"$REDIR" 2>&1; then
+        log "      dot -> blame.dot.svg"
+      else
+        log "      dot render skipped (install graphviz; blame.dot ready for manual render)"
+      fi
+    fi
+  else
+    log "[4/5] tensor_blame not found (build/install it: meson install -C hpctoolkit/builddir)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 5: hpcprof — build the database. Skipped with -no-prof.
 # ---------------------------------------------------------------------------
 if [ "$DO_PROF" = 1 ]; then
-  log "[4/4] hpcprof -> $DB"
+  log "[5/5] hpcprof -> $DB"
   hpcprof -o "$DB" "$MEAS" >>"$REDIR" 2>&1
 else
-  log "[4/4] hpcprof skipped (-no-prof)"
+  log "[5/5] hpcprof skipped (-no-prof)"
 fi
 
 log "done."
 [ -f "$MEAS/pc_sampling/pc_samples.csv" ] && \
   echo "    pc-sampling stalls: $MEAS/pc_sampling/pc_samples.csv"
 [ -d "$MEAS/torch_view" ] && echo "    torch_view output : $MEAS/torch_view/{forest.txt,torch_view_report.csv}"
-[ -f "$MEAS/torch_view/torch_view_report.csv.context" ] && \
-  echo "    tensor callpaths  : $MEAS/torch_view/torch_view_report.csv.context"
+[ -f "$MEAS/tensor_stall_cost.csv" ] && \
+  echo "    tensor stall cost : $MEAS/tensor_stall_cost.csv"
+[ -f "$MEAS/blame.dot" ] && \
+  echo "    blame forest (dot): $MEAS/blame.dot   (dot -Tsvg ... -o ....svg)"
+[ -f "$MEAS/blame.dot.svg" ] && \
+  echo "    blame forest (svg): $MEAS/blame.dot.svg"
 [ "$DO_PROF" = 1 ] && echo "    database          : $DB"
