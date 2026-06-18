@@ -170,6 +170,36 @@ EXTERNC torch_monitor_status_t torch_monitor_python_state_get(
   return status;
 }
 
+// TENPROF: cached variant -- returns the thread-local Python state from the most
+// recent fresh fetch (the launching op's enter) WITHOUT acquiring the GIL. Used by
+// redshow's kernel_op_callback, which runs while the sanitizer holds the per-context
+// entry->lock; acquiring the GIL there deadlocks against a thread that holds the GIL
+// and spins on entry->lock (AB-BA). Same copy-out as above, but get_states(true).
+EXTERNC torch_monitor_status_t torch_monitor_python_state_get_cached(
+    size_t max_num_states, torch_monitor_python_state_t* states, size_t* num_states) {
+  torch_monitor_status_t status;
+
+  auto& python_state_monitor = PythonStateMonitor::instance();
+
+  auto& python_states = python_state_monitor.get_states(true);  // cached -> NO GIL
+
+  if (python_states.empty()) {
+    status = TORCH_MONITOR_STATUS_PYTHON_STATES_NULL;
+  } else {
+    status = TORCH_MONITOR_STATUS_SUCCESS;
+
+    *num_states = std::min(python_states.size(), max_num_states);
+    for (size_t i = 0; i < *num_states; ++i) {
+      states[i].file_name = python_states[i].file_name.c_str();
+      states[i].function_name = python_states[i].function_name.c_str();
+      states[i].function_first_lineno = python_states[i].function_first_lineno;
+      states[i].lineno = python_states[i].lineno;
+    }
+  }
+
+  return status;
+}
+
 }  // namespace torch_monitor
 
 static volatile bool torch_monitor_inputs_capture_enable = false;

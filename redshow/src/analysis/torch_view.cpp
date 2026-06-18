@@ -7,9 +7,16 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <queue>
 #include <set>
 #include <string.h>
+
+// TENPROF: the torch_view callback mutex, defined in redshow.cpp. The kernel-
+// analysis methods below lock on THIS (instead of Analysis::_lock) so they
+// serialize with torch_view_callback (the PyTorch-op callback), which uses the
+// same mutex. Lock it AFTER any GIL-acquiring call to keep the GIL->mtx order.
+std::mutex& redshow_torchview_mtx();
 
 #include "torch_monitor.h"
 
@@ -23,7 +30,12 @@ namespace redshow {
 
   void TorchView::op_callback(OperationPtr op, bool is_submemory /* default = false */) {
         // Add a calling context node
-    lock();
+    // TENPROF: was lock()/unlock() == Analysis::_lock, a DIFFERENT mutex than the
+    // PyTorch-op callback's redshow_torchview_mtx() -> the two contexts raced on the
+    // shared view-forest maps -> heap corruption on multi-threaded apps. Each
+    // specific callback below now locks the SHARED redshow_torchview_mtx() itself
+    // (kernel locks AFTER its GIL fetch, to preserve GIL->mtx order). Old wrapper:
+    // lock();
     if (op->type == OPERATION_TYPE_KERNEL) {
       kernel_op_callback(std::dynamic_pointer_cast<Kernel>(op));
     } else if (op->type == OPERATION_TYPE_MEMORY) {
@@ -35,7 +47,7 @@ namespace redshow {
     } else if (op->type == OPERATION_TYPE_MEMSET) {
       memset_op_callback(std::dynamic_pointer_cast<Memset>(op));
     }
-    unlock();
+    // unlock();
   }
 
   /**
@@ -56,7 +68,20 @@ namespace redshow {
  * Need fix
  * */
   void TorchView::kernel_op_callback(std::shared_ptr<Kernel> op) {
-    torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+    // TENPROF deadlock fix (option 1): use the CACHED (no-GIL) python state instead
+    // of a fresh fetch. This runs while the sanitizer holds the per-context
+    // entry->lock; the fresh fetch acquires the GIL there and deadlocks (AB-BA)
+    // against a thread holding the GIL and spinning on entry->lock. The cached
+    // thread-local state is the launching op's stack (captured fresh, GIL-safe, at
+    // the PyTorch op-enter on this same thread) -- the correct state for this kernel.
+    // torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+    torch_monitor_python_state_get_cached(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
+    // TENPROF race fix: hold the SHARED torch_view mutex across the whole analysis
+    // (which mutates call_path_map / _roots / _input_viewnode_forest_ptrs /
+    // torchview_memory_snapshot / ...). Taken AFTER the GIL-acquiring call above so
+    // the order is GIL->mtx (matches torch_view_callback) -> no mtx<->GIL deadlock.
+    // The analysis body below acquires no GIL, so holding mtx across it is safe.
+    std::lock_guard<std::mutex> _tv_lk(redshow_torchview_mtx());
     std::string all_states("");
     if (num__delayed_states > 0 && num__delayed_states <= MAX_NUM_STATES) {
       for(size_t i = 0; i < num__delayed_states; i++) {
@@ -202,7 +227,13 @@ namespace redshow {
       if (torchview_dict->view_range_size == 0){
         return;
       }
-      assert(torchview_dict->view_range_size == torchview_memory_snapshot.size());
+      // TENPROF: the GPU dict was sized from torchview_memory_snapshot at launch;
+      // if the snapshot changed by analysis time the bitmap indices no longer line
+      // up. Quietly skip this kernel's on-GPU analysis instead of asserting -- a
+      // failed assert() would take the whole process down.
+      if (torchview_dict->view_range_size != torchview_memory_snapshot.size()) {
+        return;
+      }
 
       uint64_t write_pc_size = torchview_dict->current_write_pc_size;
       uint64_t read_pc_size = torchview_dict->current_read_pc_size;
@@ -229,8 +260,10 @@ namespace redshow {
             for (size_t shift_offset = 0; shift_offset < 64; shift_offset++) {
               uint64_t flag = (mask << shift_offset);
               if((range_group & flag) == flag) { // Hit! Start logging data
-                std::map<redshow::MemoryRange, redshow::TorchView::ViewNode *>::iterator iter = torchview_memory_snapshot.begin(); // + (r_i * torchview_dict->view_range_size) + r_j * 64 + shift_offset;
-                std::advance(iter, r_j * 64 + shift_offset);
+                size_t _adv = r_j * 64 + shift_offset;  // TENPROF: bound -- a set bit
+                if (_adv >= torchview_memory_snapshot.size()) continue;  // in the partial
+                std::map<redshow::MemoryRange, redshow::TorchView::ViewNode *>::iterator iter = torchview_memory_snapshot.begin(); // last column overshoots size() -> std::advance past end() was UB
+                std::advance(iter, _adv);
                 if(iter->second){
                   view_node_hit_set.insert(iter->second);
                 }
@@ -288,8 +321,10 @@ namespace redshow {
             for (size_t shift_offset = 0; shift_offset < 64; shift_offset++) {
               uint64_t flag = (mask << shift_offset);
               if((range_group & flag) == flag) { // Hit! Start logging data
-                std::map<redshow::MemoryRange, redshow::TorchView::ViewNode *>::iterator iter = torchview_memory_snapshot.begin(); // + (r_i * torchview_dict->view_range_size) + r_j * 64 + shift_offset;
-                std::advance(iter, r_j * 64 + shift_offset);
+                size_t _adv = r_j * 64 + shift_offset;  // TENPROF: bound -- a set bit
+                if (_adv >= torchview_memory_snapshot.size()) continue;  // in the partial
+                std::map<redshow::MemoryRange, redshow::TorchView::ViewNode *>::iterator iter = torchview_memory_snapshot.begin(); // last column overshoots size() -> std::advance past end() was UB
+                std::advance(iter, _adv);
                 if(iter->second){
                   view_node_hit_set.insert(iter->second);
                 }
@@ -340,6 +375,10 @@ namespace redshow {
   }
 
   void TorchView::memcpy_op_callback(std::shared_ptr<Memcpy> op) {
+    // TENPROF race fix: serialize on the SHARED torch_view mutex (no GIL acquired
+    // here, so locking at the top is safe). Was implicitly under op_callback's
+    // Analysis::_lock, a different mutex than torch_view_callback's.
+    std::lock_guard<std::mutex> _tv_lk(redshow_torchview_mtx());
     if ((op->dst_memory_op_id != REDSHOW_MEMORY_HOST && op->dst_memory_op_id != REDSHOW_MEMORY_UVM) // im case dst on device
          ||
         (op->src_memory_op_id != REDSHOW_MEMORY_HOST && op->src_memory_op_id != REDSHOW_MEMORY_UVM)) { // in case src on device
@@ -383,6 +422,8 @@ namespace redshow {
   }
 
   void TorchView::memset_op_callback(std::shared_ptr<Memset> op) {
+    // TENPROF race fix: serialize on the SHARED torch_view mutex (no GIL here).
+    std::lock_guard<std::mutex> _tv_lk(redshow_torchview_mtx());
     if (op->memory_op_id != REDSHOW_MEMORY_HOST && op->memory_op_id != REDSHOW_MEMORY_UVM) {
       u64 overwrite = op->len;
       u64 start = op->start;

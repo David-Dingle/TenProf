@@ -87,7 +87,23 @@ static redshow_data_type_t default_data_type = REDSHOW_DATA_UNKNOWN;
 
 static std::mutex mtx;  // the lock for torch_view functional callback
 
+// TENPROF: expose the torch_view callback mutex so the kernel-ANALYSIS path
+// (TorchView::kernel_op_callback / memcpy / memset in torch_view.cpp) can
+// serialize on the SAME lock as torch_view_callback / get_range_size / assemble.
+// Previously the analysis path used Analysis::_lock (a DIFFERENT mutex), so the
+// two contexts raced on the shared view-forest maps -> heap corruption on
+// multi-threaded apps (docling). Callers must hold this AFTER any GIL acquisition
+// to preserve the uniform GIL->mtx order (no mtx<->GIL deadlock).
+std::mutex& redshow_torchview_mtx() { return mtx; }
+
 unsigned long redshow_torchview_ongpu_get_range_size() {
+  // TENPROF race fix: called from the sanitizer kernel-launch callback on a worker
+  // thread; it reads/builds _input_viewnode_forest_ptrs + torchview_memory_snapshot,
+  // which torch_view_callback mutates under mtx on another thread. Without this lock
+  // the std::map is torn mid-iteration -> SIGSEGV. Safe vs the GIL deadlock: this
+  // path acquires NO GIL, and torch_view_callback takes the GIL BEFORE mtx, so the
+  // order is uniformly (GIL ->) mtx -- no cycle.
+  std::lock_guard<std::mutex> lock_guard(mtx);
   for (auto iter : analysis_enabled){
     if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
       std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
@@ -123,6 +139,9 @@ int redshow_torchview_ongpu_get_ongpu() {
 
 
 void redshow_torchview_assemble_patch_analysis_address(gpu_patch_analysis_address_t* viewnode_ranges_host) {
+  // TENPROF race fix: same as get_range_size -- this sanitizer-callback reader of
+  // torchview_memory_snapshot must serialize with torch_view_callback's mutations.
+  std::lock_guard<std::mutex> lock_guard(mtx);
   for (auto iter : analysis_enabled){
     if (iter.first == REDSHOW_ANALYSIS_TORCH_VIEW) {
       std::shared_ptr<redshow::TorchView> analysis_ptr = std::static_pointer_cast<redshow::TorchView>(iter.second);
@@ -249,6 +268,17 @@ static void python_state_report() {
  * */
 static void torch_view_callback(torch_monitor_callback_site_t callback_site,
                                   torch_monitor_callback_data_t* callback_data) {
+  // TENPROF deadlock fix (mtx <-> GIL AB-BA): fetch the Python state BEFORE taking
+  // mtx. torch_monitor_python_state_get() internally acquires the GIL; holding mtx
+  // across that acquisition imposes an mtx->GIL order that deadlocks against another
+  // thread (multi-threaded / DataParallel models) which holds the GIL and is waiting
+  // for mtx at the lock_guard below. python_states/num_states are thread_local, so
+  // this fetch needs no lock. The condition mirrors the original in-lock call
+  // (ENTER site + a non-memory op domain).
+  if (callback_site == TORCH_MONITOR_CALLBACK_ENTER &&
+      callback_data->domain != TORCH_MONITOR_DOMAIN_MEMORY) {
+    torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+  }
   std::lock_guard<std::mutex> lock_guard(mtx);
   // std::cout << "-----------------------------------" << std::endl;
   if (callback_site == TORCH_MONITOR_CALLBACK_ENTER) {
@@ -283,7 +313,9 @@ static void torch_view_callback(torch_monitor_callback_site_t callback_site,
         //     delayed_python_states[i].lineno = python_states[i].lineno;
         //   } // ready for delayed pystate insertion
         // }
-        torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
+        // TENPROF deadlock fix: now fetched BEFORE mtx (top of torch_view_callback)
+        // to keep the GIL-acquiring get_states() out of the mtx critical section.
+        // torch_monitor_python_state_get(MAX_NUM_STATES, python_states, &num_states);
         // if (num_states > 0) {
         //   torch_monitor_python_state_get(MAX_NUM_STATES, delayed_python_states, &num__delayed_states);
         // }

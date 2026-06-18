@@ -11,6 +11,7 @@
 #include <string>
 #include <optional>
 #include <stack>
+#include <unordered_set>
 
 #include "analysis.h"
 #include "binutils/cubin.h"
@@ -262,6 +263,7 @@ namespace redshow {
           for (auto child : this->_children) {
             viewnode_mem_range_map.erase(child->view_id); // used by ongpu analysis
             child->delete_children_nodes(out, viewnode_mem_range_map);
+            _live_nodes.erase(child);  // TENPROF level-1: untrack before free
             delete child;
           }
           out << "  }" << this->view_id << '\n';
@@ -330,6 +332,15 @@ namespace redshow {
    gpu_patch_aux_torchview_dict_t* torchview_dict = NULL;
 
    std::vector<ViewNode*> _roots = {};  // The node forest //TODO: optimize
+   // TENPROF level-1 crash-guard (see cclog/torchview-multithread-uaf.md): set of
+   // currently-live ViewNode*. Inserted at creation (update_view_forest), erased
+   // right before every delete (delete_forest_tree / delete_children_nodes).
+   // update_node_total_access skips any pointer NOT in this set -- this prevents the
+   // use-after-free deref when a concurrent memory-free (multi-threaded app) deleted
+   // a node still cached in torchview_memory_snapshot. static so the nested ViewNode
+   // methods can reach it. NOT a correctness fix -- only stops the SIGSEGV. All
+   // access is under the shared torch_view mutex.
+   static inline std::unordered_set<ViewNode*> _live_nodes = {};
    std::map<u64, std::vector<PyStateCTX>> call_path_map = {};
    std::vector<mem_range_t> gpu_mem_blocks = {};
    std::map<int64_t, ViewNode*> _input_viewnode_forest_ptrs = {};
@@ -505,6 +516,7 @@ namespace redshow {
                                             tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides,
                                             data_ptr,
                                             metadata_ptr, _input_view->mem_block_range);
+             _live_nodes.insert(_node);  // TENPROF level-1 crash-guard: track live node
              _input_view->_children.push_back(_node);
              result = _node; // Return type: return the new childe
              call_path_map[global_id] = std::vector<PyStateCTX>();
@@ -525,6 +537,7 @@ namespace redshow {
        ViewNode* _root_node_ptr = new ViewNode(global_id, tensor_data.index, tensor_data.numel, tensor_data.dim, tensor_data.dtype, tensor_data.itemsize,
                                                                                tensor_data.storage_offset, tensor_data.sizes, tensor_data.strides, data_ptr,
                                                                                metadata_ptr);
+       _live_nodes.insert(_root_node_ptr);  // TENPROF level-1 crash-guard: track live node
        //_roots.push_back(_root_node_ptr);
        auto it = std::lower_bound(_roots.begin(), _roots.end(), _root_node_ptr, ViewNode_ptr_comp);
        _roots.insert(it, _root_node_ptr);
@@ -569,6 +582,21 @@ namespace redshow {
    std::ofstream forest_tree_out;
    void delete_forest_tree(const std::string &output_dir, data_ptr_t mem_start_addr, uint64_t total_allocated) {
      lock();
+     // TENPROF kernel_replay hang fix (root cause of the docling spin): this free
+     // deletes the ViewNodes in [mem_start_addr, mem_start_addr+total_allocated], but
+     // the on-GPU snapshot (torchview_memory_snapshot) cached raw ViewNode* for those
+     // ranges and was NEVER cleaned here -> the analysis later read DANGLING pointers
+     // from the snapshot -> heap/tree corruption -> a std::map walk spins forever
+     // (hang) on multi-threaded apps. Drop those snapshot entries NOW, before the
+     // nodes are freed, so no dangling ViewNode* survives in the snapshot. Serialized
+     // with the analysis by the shared torch_view mutex held by the caller.
+     for (auto _sit = torchview_memory_snapshot.begin(); _sit != torchview_memory_snapshot.end(); ) {
+       if (_sit->first.start >= (u64)mem_start_addr &&
+           _sit->first.start <= (u64)mem_start_addr + total_allocated)
+         _sit = torchview_memory_snapshot.erase(_sit);
+       else
+         ++_sit;
+     }
      if (!forest_tree_out.is_open()){
        forest_tree_out = std::ofstream(output_dir + "forest.txt", std::ios::app);
      }
@@ -602,6 +630,7 @@ namespace redshow {
            _roots.at(i)->delete_children_nodes(forest_tree_out, viewnode_mem_range_map);
            forest_tree_out << '\n';
          }
+         _live_nodes.erase(_roots.at(i));  // TENPROF level-1: untrack before free
          delete _roots.at(i);
          _roots.erase(_roots.begin()+i);
          --i; //break;
@@ -636,6 +665,12 @@ namespace redshow {
     //    }
     //  }
      for (auto viter : view_nodes) {
+       // TENPROF level-1 crash-guard: skip stale/freed ViewNode*. A concurrent
+       // memory-free on a multi-threaded app can delete a node still cached in
+       // torchview_memory_snapshot, leaving a dangling (non-null) pointer here ->
+       // use-after-free SIGSEGV. A null check is useless (freed != null); we test
+       // membership in the live set instead. See cclog/torchview-multithread-uaf.md.
+       if (_live_nodes.find(viter) == _live_nodes.end()) continue;
        if(viter->pc_access.find(pc) != viter->pc_access.end()) {
          viter->pc_access[pc]++;
        } else {

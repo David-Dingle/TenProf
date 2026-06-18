@@ -280,6 +280,13 @@ EXTERNC torch_monitor_status_t torch_monitor_domain_enable(torch_monitor_domain_
 EXTERNC torch_monitor_status_t torch_monitor_python_state_get(
     size_t max_num_states, torch_monitor_python_state_t* states, size_t* num_states);
 
+// TENPROF: cached, NO-GIL variant of the above (returns the thread-local state from
+// the last fresh fetch). Safe to call while a lock that the GIL-holder may want is
+// held (e.g. the sanitizer per-context lock in kernel_op_callback) -- avoids the
+// entry->lock<->GIL deadlock on multi-threaded apps.
+EXTERNC torch_monitor_status_t torch_monitor_python_state_get_cached(
+    size_t max_num_states, torch_monitor_python_state_t* states, size_t* num_states);
+
 /**
  * @brief Start monitoring pytorch functions in registered domains.
  * This function should be called only once at process initialization.

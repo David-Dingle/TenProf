@@ -84,8 +84,8 @@ tenprof [options] <python-script> [script args]
   -ck <knob>      extra control knob (repeatable),
                   e.g. -ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=1
   -l  <launcher>  launcher prefix, e.g. -l "mpirun -np 1"
-  -no-warmup      skip the warmup + hpcstruct passes (analysis only)
-  -no-prof        skip the hpcprof phase (collection only)
+  -no-warmup      skip the warmup + hpcstruct passes (use cached data)
+  -no-prof        skip the hpcprof phase (inst stalls -> tensors)
   -v              verbose: tee logs to tenprof.log
   -h              help
 ```
@@ -96,8 +96,12 @@ Events:
   stalls, joined per kernel. Produces `tensor_stall_cost.csv` + `blame.dot`.
 - **`torch_view`** — tensor accesses only (`compute-sanitizer` + redshow).
 - **`pc_sampling`** — memory stalls only (CUPTI PC Sampling).
-- **`both`** — the older two-run fallback: a `pc_sampling` run then a `torch_view` run
-  into the same measurements dir, joined later by hpcprof on `(pystates_hash, pc)`.
+- **`both`** — *application replay*: a whole-application `pc_sampling` run then a
+  whole-application `torch_view` run into the same measurements dir. Because the two
+  runs are separate processes, they are joined on the content-based `(pystates_hash,
+  pc)` key (not `kernel_id`, which is process-local). `tensor_blame` then runs and
+  produces the same `tensor_stall_cost.csv` + `blame.dot` as `kernel_replay`. Use this
+  when per-kernel `kernel_replay` is too slow or unstable on a given model.
 
 ## Outputs (`out-measurements/`)
 

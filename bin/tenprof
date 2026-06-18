@@ -20,6 +20,10 @@
 #   tenprof [options] <python-script> [script args]
 #   options:
 #     -e <event>     kernel_replay (default) | torch_view | pc_sampling | both
+#     -attr <method> torch_view tensor<->access-pc attribution (default: gpu):
+#                      gpu = on-GPU bitmap (fast); cpu = CPU memory-access trace
+#                      (slower, more robust). Works for torch_view/both/kernel_replay.
+#                      Shorthand for -ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=1|0.
 #     -j <threads>   hpcstruct/hpcprof threads (default: nproc)
 #     -env <name>    conda env to activate (default: current active env)
 #     -o <dir>       output prefix (default: tenprof). Produces <dir>-measurements
@@ -34,7 +38,7 @@
 
 set -o pipefail
 
-usage() { sed -n '2,31'p "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,35'p "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 # ---------------------------------------------------------------------------
 # Defaults / arg parsing
@@ -44,6 +48,7 @@ THREADS=$(nproc)
 CONDA_ENV=""
 OUT=tenprof
 CONTROL_KNOBS=""
+ATTR=gpu          # torch_view attribution: gpu (on-GPU bitmap) | cpu (CPU trace)
 LAUNCHER=""
 VERBOSE=0
 DO_WARMUP=1
@@ -57,6 +62,7 @@ while test "x$1" != x; do
     -env) CONDA_ENV="$1"; shift ;;
     -o)   OUT="$1"; shift ;;
     -ck)  CONTROL_KNOBS="$CONTROL_KNOBS -ck $1"; shift ;;
+    -attr) ATTR="$1"; shift ;;
     -l)   LAUNCHER="$1"; shift ;;
     -no-warmup) DO_WARMUP=0 ;;
     -no-prof)   DO_PROF=0 ;;
@@ -65,6 +71,21 @@ while test "x$1" != x; do
     *)    set -- "$arg" "$@"; break ;;
   esac
 done
+
+# Attribution method -> the on-GPU vs CPU torch_view knob. gpu = on-GPU bitmap
+# (per-kernel pc<->tensor on the device; fast, default); cpu = CPU memory-access
+# trace (transform_pc on the host; slower, more robust). Both produce joinable
+# function-relative pcs and work for torch_view / both / kernel_replay. An explicit
+# -ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=... always wins over -attr.
+case "$ATTR" in
+  gpu|GPU|on_gpu|ongpu) ATTR_KNOB="-ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=1" ;;
+  cpu|CPU|on_cpu|oncpu) ATTR_KNOB="-ck HPCRUN_SANITIZER_TORCH_VIEW_ONGPU=0" ;;
+  *) echo "tenprof: -attr must be 'gpu' or 'cpu' (got '$ATTR')"; exit 1 ;;
+esac
+case "$CONTROL_KNOBS" in
+  *TORCH_VIEW_ONGPU*) ;;                                  # user set it via -ck; keep it
+  *) CONTROL_KNOBS="$CONTROL_KNOBS $ATTR_KNOB" ;;
+esac
 
 # Which profiling pass(es) to run. `both` does the full GPA 2-run collection:
 # the pc_sampling run (stalls) and the torch_view run (tensor accesses), into the
@@ -150,9 +171,22 @@ GCCS="$(gcc -print-file-name=libgcc_s.so.1 2>/dev/null)"
 log "TenProf install : $PREFIX"
 log "conda env       : ${CONDA_ENV:-$(basename "${CONDA_PREFIX:-?}")}  (python=$PY_BIN)"
 log "event           : $EVENT   threads=$THREADS"
+log "attribution     : $ATTR  (torch_view tensor<->pc: $([ "$ATTR" = cpu ] && echo 'CPU trace' || echo 'on-GPU bitmap'))"
 log "measurements    : $MEAS    database=$DB"
 
-rm -rf "$MEAS" "$DB"
+# Always wipe the database. Wipe measurements ONLY when (re)warming: warmup cubins +
+# hpcstruct are deterministic for the same app/env, so -no-warmup reuses an existing
+# $MEAS (cubins/gpubins/structs) and just re-runs the profiling pass into it. (Without
+# this guard -no-warmup wiped the very cubins it needs.) Profiling output subdirs
+# (torch_view/, pc_sampling/) are cleared below so a reused $MEAS starts clean.
+rm -rf "$DB"
+if [ "$DO_WARMUP" = 1 ]; then
+  rm -rf "$MEAS"
+else
+  rm -rf "$MEAS/torch_view" "$MEAS/pc_sampling" "$MEAS/cfg" \
+         "$MEAS"/tensor_stall_cost.csv "$MEAS"/blame.dot "$MEAS"/blame.dot.svg \
+         "$MEAS"/*.hpcrun "$MEAS"/*.log 2>/dev/null
+fi
 
 # ---------------------------------------------------------------------------
 # hpcstruct helper for CPU support libraries (best-effort; skip if missing)
@@ -209,12 +243,21 @@ for ev in $EVENTS; do
 done
 
 # ---------------------------------------------------------------------------
-# Phase 4: blame-shift -> Tensor Stall Cost (kernel_replay only). tensor_blame
-# reads pc_samples.csv + torch_view, disassembles the cubins (GPA lib/cuda),
-# blame-shifts memory stalls to their producing loads, and joins on
-# (pystates_hash, pc) -> tensor_stall_cost.csv + blame.dot (graphviz).
+# Phase 4: blame-shift -> Tensor Stall Cost. tensor_blame reads pc_samples.csv +
+# torch_view, disassembles the cubins (GPA lib/cuda), blame-shifts memory stalls
+# to their producing loads, and joins on (pystates_hash, pc) -> tensor_stall_cost
+# .csv + blame.dot (graphviz).
+#
+# The join key is (pystates_hash, pc) -- content-based and IDENTICAL across
+# processes (both runs hash the same Python call stack with the same std::hash),
+# so it works for BOTH modes:
+#   kernel_replay : one process; pc_samples.csv + torch_view are from the same run.
+#   both          : application replay -- the SEPARATE pc_sampling and torch_view
+#                   runs each stamp pystates_hash, so the cross-process join holds
+#                   (kernel_id would NOT match across processes; pystates_hash does).
+# Run whenever both inputs are present (skips pc_sampling-only / torch_view-only).
 # ---------------------------------------------------------------------------
-if [ "$EVENT" = kernel_replay ] && [ -f "$MEAS/pc_sampling/pc_samples.csv" ]; then
+if [ -f "$MEAS/pc_sampling/pc_samples.csv" ] && [ -f "$MEAS/torch_view/torch_view_report.csv" ]; then
   TB="$HPCBIN/tensor_blame"
   [ -x "$TB" ] || TB="$(command -v tensor_blame 2>/dev/null)"
   if [ -x "$TB" ]; then
